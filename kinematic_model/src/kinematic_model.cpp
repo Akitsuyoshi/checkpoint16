@@ -21,7 +21,7 @@ public:
     h_wheel_base_ = 0.170 / 2.0;
     h_track_width_ = 0.26969 / 2.0;
     radius_ = 0.100 / 2.0;
-    RCLCPP_INFO(get_logger(), "Node initialized");
+    RCLCPP_INFO(get_logger(), "Initialized node");
   }
 
 private:

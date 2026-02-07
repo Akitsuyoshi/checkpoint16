@@ -26,6 +26,10 @@ class WheelVelocitiesPublisher : public rclcpp::Node {
 public:
   WheelVelocitiesPublisher() : Node("wheel_velocities_publisher") {
     pub_ = create_publisher<Float32MultiArray>("/wheel_speed", 10);
+    while (pub_->get_subscription_count() == 0 && rclcpp::ok()) {
+      RCLCPP_INFO(get_logger(), "Waiting for /wheel_speed subscriber");
+      rclcpp::sleep_for(std::chrono::milliseconds(200));
+    }
     timer_ = create_wall_timer(std::chrono::milliseconds(50),
                                [this]() { callback(); });
 
