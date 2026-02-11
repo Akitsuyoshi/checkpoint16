@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -14,6 +15,24 @@
 #include "tf2/LinearMath/Matrix3x3.h"
 #include "tf2/LinearMath/Quaternion.h"
 
+/*
+ * Generates a figure-eight trajectory using incremental waypoints.
+ * Converts pose error -> body twist -> wheel angular velocities for
+ * a 4-wheel omnidirectional robot.
+ *
+ * Wheel order:
+ *   u1 = Front Left
+ *   u2 = Front Right
+ *   u3 = Rear Right
+ *   u4 = Rear Left
+ *
+ * Kinematic chain:
+ *   pose error (world frame) [yaw_err, x_err, y_err]
+ *        ↓
+ *   body twist [wz, vx, vy]
+ *        ↓
+ *   wheel angular velocities [u1, u2, u3, u4]
+ */
 class EightTrajectory : public rclcpp::Node {
   using Float32MultiArray = std_msgs::msg::Float32MultiArray;
   using Odometry = nav_msgs::msg::Odometry;
@@ -31,78 +50,53 @@ public:
     timer_ = create_wall_timer(std::chrono::milliseconds(50),
                                [this]() { motion_callback(); });
 
-    H_ = get_H_();
+    H_ = compute_H_matrix();
+    yaw_ = std::numeric_limits<float>::quiet_NaN();
     x_ = std::numeric_limits<float>::quiet_NaN();
     y_ = std::numeric_limits<float>::quiet_NaN();
-    yaw_ = std::numeric_limits<float>::quiet_NaN();
-    way_points_ = {{0.0, 1.0, -1.0},      {0.0, 1.0, 1.0},
-                   {0.0, 1.0, 1.0},       {-1.5708, 1.0, -1.0},
-                   {-1.5708, -1.0, -1.0}, {0.0, -1.0, 1.0},
-                   {0.0, -1.0, 1.0},      {0.0, -1.0, -1.0}};
+    target_yaw_ = 0.0;
+    target_x_ = 0.0;
+    target_y_ = 0.0;
+
+    //  Waypoints are relative increments: [dyaw, dx, dy]
+    //  Applied cumulatively to generate a figure-eight motion.
+    way_points_ = {
+        {0.0, 0.0, 0.0},  {0.0, 1.0, -1.0},     {0.0, 1.0, 1.0},
+        {0.0, 1.0, 1.0},  {-1.5708, 1.0, -1.0}, {-1.5708, -1.0, -1.0},
+        {0.0, -1.0, 1.0}, {0.0, -1.0, 1.0},     {0.0, -1.0, -1.0}};
     way_point_count_ = 0;
-    target_yaw_ = way_points_[way_point_count_][0];
-    target_x_ = way_points_[way_point_count_][1];
-    target_y_ = way_points_[way_point_count_][2];
+
     RCLCPP_INFO(get_logger(), "Initialized node");
-    RCLCPP_INFO(get_logger(), "Moving to the waypoint %zu, [%f, %f, %f]",
-                way_point_count_ + 1, target_yaw_, target_x_, target_y_);
   }
 
 private:
   void odom_callback(const Odometry::SharedPtr msg) {
-    auto &position = msg->pose.pose.position;
-    x_ = position.x;
-    y_ = position.y;
-
     auto &orientation = msg->pose.pose.orientation;
     tf2::Quaternion q(orientation.x, orientation.y, orientation.z,
                       orientation.w);
     double roll, pitch, yaw;
     tf2::Matrix3x3(q).getRPY(roll, pitch, yaw);
     yaw_ = yaw;
+
+    auto &position = msg->pose.pose.position;
+    x_ = position.x;
+    y_ = position.y;
   }
 
   void motion_callback() {
-    if (std::isnan(yaw_)) {
+    if (std::isnan(yaw_) || std::isnan(x_) || std::isnan(y_)) {
       return;
     }
-
-    std::vector<float> errors = get_error();
-    bool is_reached =
-        std::hypot(errors[1], errors[2]) < 0.05 && std::abs(errors[0]) < 0.1;
-    if (is_reached) {
-      way_point_count_++;
-      if (way_point_count_ >= way_points_.size()) {
-        timer_->cancel();
-        Float32MultiArray msg;
-        msg.data = {0, 0, 0, 0};
-        pub_->publish(msg);
-        RCLCPP_INFO(get_logger(), "Stop robot");
-        return;
-      }
-
-      auto way_point = way_points_[way_point_count_];
-      target_yaw_ += way_point[0];
-      target_x_ += way_point[1];
-      target_y_ += way_point[2];
-      RCLCPP_INFO(get_logger(), "Moving to the waypoint %zu, [%f, %f, %f]",
-                  way_point_count_ + 1, target_yaw_, target_x_, target_y_);
+    if (is_reached()) {
+      update_way_point_count();
     }
 
-    auto way_point = way_points_[way_point_count_];
-    errors = get_error();
-    float K = 0.9;
-    float dphi = K * errors[0];
-    float dx = K * errors[1];
-    float dy = K * errors[2];
-
-    Float32MultiArray msg;
-    auto twist = velocity_to_twist(dphi, dx, dy);
-    msg.data = twist_to_wheels(twist[0], twist[1], twist[2]);
-    pub_->publish(msg);
+    auto twist = compute_body_twist();
+    auto wheels = compute_wheel_speeds(twist);
+    publish_velocity(wheels);
   }
 
-  std::vector<float> get_error() const {
+  std::tuple<float, float, float> get_errors() const {
     float error_yaw = normalize_angle(target_yaw_ - yaw_);
     float error_x = target_x_ - x_;
     float error_y = target_y_ - y_;
@@ -110,59 +104,120 @@ private:
   }
 
   float normalize_angle(float angle) const {
-    return std::atan2(sin(angle), cos(angle));
+    return std::atan2(std::sin(angle), std::cos(angle));
   }
 
-  std::vector<float> velocity_to_twist(float dphi, float dx, float dy) const {
-    std::vector<std::vector<float>> R = {
-        {1.0, 0.0, 0.0},
-        {0.0, std::cos(yaw_), std::sin(yaw_)},
-        {0.0, -std::sin(yaw_), std::cos(yaw_)}};
-    std::vector<float> vels = {dphi, dx, dy};
+  bool is_reached() const {
+    auto [err_yaw, err_x, err_y] = get_errors();
+    return std::abs(err_yaw) < 0.1 && std::hypot(err_x, err_y) < 0.05;
+  }
 
-    std::vector<float> twist;
-    for (size_t i = 0; i < R.size(); i++) {
-      float temp = 0;
-      for (size_t j = 0; j < R[i].size(); j++) {
-        temp += R[i][j] * vels[j];
-      }
-      twist.emplace_back(temp);
+  void update_way_point_count() {
+    way_point_count_++;
+    if (way_point_count_ >= way_points_.size()) {
+      publish_velocity({0.0, 0.0, 0.0, 0.0});
+      RCLCPP_INFO(get_logger(), "Stop robot");
+      timer_->cancel();
+      return;
     }
-
-    return twist;
+    auto wp = way_points_[way_point_count_];
+    update_target(wp[0], wp[1], wp[2]);
   }
 
-  std::vector<float> twist_to_wheels(float wz, float vx, float vy) const {
-    std::vector<float> vels = {wz, vx, vy};
-    std::vector<float> wheel_vels;
+  void update_target(float yaw, float x, float y) {
+    target_yaw_ += yaw;
+    target_x_ += x;
+    target_y_ += y;
+    RCLCPP_INFO(get_logger(), "Moving to the waypoint %zu, [%f, %f, %f]",
+                way_point_count_, target_yaw_, target_x_, target_y_);
+  }
+
+  /*
+   * Convert pose error (world frame) -> body frame twist
+   * Let:
+   *   θ      = current robot yaw (world frame)
+   *   eθ     = yaw error = normalize(target_yaw − yaw)
+   *   ex, ey = position error in world frame
+   *
+   * Convert translational error from world frame → body frame:
+   *   vx =  cos(θ) * ex + sin(θ) * ey
+   *   vy = -sin(θ) * ex + cos(θ) * ey
+   * Angular velocity command:
+   *   wz = eθ
+   *
+   * Result:
+   *   body_twist = [wz, vx, vy]
+   */
+  std::vector<float> compute_body_twist() const {
+    auto [dphi, dx, dy] = get_errors();
+    float vx_body = std::cos(yaw_) * dx + std::sin(yaw_) * dy;
+    float vy_body = -std::sin(yaw_) * dx + std::cos(yaw_) * dy;
+
+    return {dphi, vx_body, vy_body};
+  }
+
+  /*
+   * Maps body twist -> wheel angular velocities using mecanum model
+   * Robot geometry:
+   *   L = half wheel base
+   *   W = half track width
+   *   r = wheel radius
+   *
+   * Define k = (L + W) / r
+   *
+   * Wheel speed mapping (mecanum drive):
+   *   u1 = (-k * wz + vx - vy)
+   *   u2 = ( k * wz + vx + vy)
+   *   u3 = ( k * wz + vx - vy)
+   *   u4 = (-k * wz + vx + vy)
+   *
+   * Final output:
+   *   wheel_speeds = [u1, u2, u3, u4]
+   */
+  std::vector<float>
+  compute_wheel_speeds(const std::vector<float> &twist) const {
+    std::vector<float> wheels(4, 0.0);
     for (size_t i = 0; i < H_.size(); i++) {
-      float temp = 0;
-      for (size_t j = 0; j < H_[i].size(); j++) {
-        temp += H_[i][j] * vels[j];
-      }
-      wheel_vels.emplace_back(temp);
+      wheels[i] =
+          H_[i][0] * twist[0] + H_[i][1] * twist[1] + H_[i][2] * twist[2];
     }
-
-    return wheel_vels;
+    return wheels;
   }
 
-  std::vector<std::vector<float>> get_H_() const {
-    float h_wheel_base_ = 0.170 / 2.0;
-    float h_track_width_ = 0.26969 / 2.0;
-    float radius_ = 0.100 / 2.0;
-    std::vector<std::vector<float>> H = {
-        {-(h_wheel_base_ + h_track_width_), 1.0, -1.0},
-        {(h_wheel_base_ + h_track_width_), 1.0, 1.0},
-        {(h_wheel_base_ + h_track_width_), 1.0, -1.0},
-        {-(h_wheel_base_ + h_track_width_), 1.0, 1.0}};
-
+  // Build wheel mapping matrix H
+  //    Input : body twist [wz, vx, vy]
+  //    Output: wheel speeds [u1, u2, u3, u4]
+  //
+  // Geometry:
+  //  L = half wheel base
+  //  W = half track width
+  //  r = wheel radius
+  std::vector<std::vector<float>> compute_H_matrix() const {
+    float L = 0.170 / 2.0;
+    float W = 0.26969 / 2.0;
+    float r = 0.100 / 2.0;
+    std::vector<std::vector<float>> H = {{-(L + W), 1.0, -1.0},
+                                         {(L + W), 1.0, 1.0},
+                                         {(L + W), 1.0, -1.0},
+                                         {-(L + W), 1.0, 1.0}};
     for (auto &row : H) {
       for (auto &col : row) {
-        col /= radius_;
+        col /= r;
       }
     }
-
     return H;
+  }
+
+  void publish_velocity(const std::vector<float> &velocities) const {
+    if (velocities.size() != 4) {
+      RCLCPP_WARN(get_logger(), "Expects 4 wheel speeds, received %zu",
+                  velocities.size());
+      return;
+    }
+
+    Float32MultiArray msg;
+    msg.data = velocities;
+    pub_->publish(msg);
   }
 
   rclcpp::Publisher<Float32MultiArray>::SharedPtr pub_;
@@ -170,7 +225,6 @@ private:
   rclcpp::TimerBase::SharedPtr timer_;
   std::vector<std::vector<float>> way_points_;
   size_t way_point_count_;
-  std::vector<float> wheel_vels_;
   std::vector<std::vector<float>> H_;
   float yaw_;
   float x_;
